@@ -22,7 +22,6 @@ Sections
 
 from __future__ import annotations
 
-import io
 import json
 import time
 from typing import Any
@@ -58,6 +57,16 @@ _LHP_RATE = 0.38
 
 # Chart palette
 _PALETTE = ["#4C8AC6", "#E07B54", "#5DBB8A", "#C67BB5", "#E0C454", "#7BC6C6"]
+
+# Column alias map: b_* prefix (Savant URL export) → standard names (Savant UI export)
+_SAVANT_ALIASES: dict[str, str] = {
+    "b_pa": "pa", "b_ab": "ab", "b_hit": "hit",
+    "b_single": "single", "b_double": "double", "b_triple": "triple",
+    "b_home_run": "home_run", "b_strikeout": "strikeout", "b_walk": "walk",
+    "b_k_percent": "k_percent", "b_bb_percent": "bb_percent",
+    "b_rbi": "rbi",
+}
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -324,7 +333,6 @@ _PLAYER_TEAM: dict[str, str] = {
     # Padres
     "Bogaerts, Xander": "SD", "Tatis Jr., Fernando": "SD", "Machado, Manny": "SD",
     "Profar, Jurickson": "SD", "Cronenworth, Jake": "SD", "Campusano, Luis": "SD",
-    "Soto, Juan": "SD",  # note: may have moved; included for roster completeness
     # Giants
     "Bailey, Patrick": "SF", "Flores, Wilmer": "SF", "Conforto, Michael": "SF",
     "Slater, Austin": "SF", "Estrada, Thairo": "SF", "Davis, JD": "SF",
@@ -409,7 +417,24 @@ def load_savant_csv(path: str) -> pd.DataFrame:
     df = pd.read_csv(path, encoding="utf-8-sig")
     df.columns = df.columns.str.strip().str.lower()
 
-    df["Name"] = df["last_name, first_name"].astype(str).str.strip()
+    # ── Column alias remapping (see module-level _SAVANT_ALIASES) ─────────────
+    for old, new in _SAVANT_ALIASES.items():
+        if old in df.columns and new not in df.columns:
+            df.rename(columns={old: new}, inplace=True)
+
+    # ── Name column ───────────────────────────────────────────────────────────
+    # Savant exports a single "last_name, first_name" column; some exports split
+    # it or use "player_name" / "name" instead.
+    if "last_name, first_name" in df.columns:
+        df["Name"] = df["last_name, first_name"].astype(str).str.strip()
+    elif "player_name" in df.columns:
+        df["Name"] = df["player_name"].astype(str).str.strip()
+    elif "last_name" in df.columns and "first_name" in df.columns:
+        df["Name"] = (df["last_name"].str.strip()
+                      + ", " + df["first_name"].str.strip())
+    else:
+        # Last resort: use first text column
+        df["Name"] = df.iloc[:, 0].astype(str).str.strip()
 
     numeric_cols = ["pa", "ab", "single", "double", "triple", "home_run",
                     "k_percent", "bb_percent", "babip", "b_hit_by_pitch",
@@ -419,21 +444,34 @@ def load_savant_csv(path: str) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
+    # ── PA ────────────────────────────────────────────────────────────────────
+    if "pa" not in df.columns:
+        # Reconstruct from AB if PA column is missing entirely
+        df["pa"] = df.get("ab", pd.Series(0, index=df.index))
     df["PA"] = df["pa"].clip(lower=1)
 
-    # Savant exports k_percent / bb_percent as percentages (21.5, not 0.215)
-    df["K_pct"]  = df["k_percent"]  / 100.0
-    df["BB_pct"] = df["bb_percent"] / 100.0
+    # ── Rate stats ────────────────────────────────────────────────────────────
+    # k_percent / bb_percent: Savant exports as percentage (21.5, not 0.215).
+    # Detect format by median and convert accordingly.
+    for raw, out in [("k_percent", "K_pct"), ("bb_percent", "BB_pct")]:
+        if raw in df.columns:
+            vals = df[raw]
+            df[out] = vals / 100.0 if vals.median() > 1.0 else vals
+        else:
+            df[out] = 0.22 if out == "K_pct" else 0.08
 
     pa = df["PA"]
-    df["HR_pct"]  = df["home_run"]       / pa
-    df["HBP_pct"] = df["b_hit_by_pitch"] / pa
-    df["BABIP"]   = df["babip"]
+    df["HR_pct"]  = df["home_run"].clip(lower=0)       / pa if "home_run"       in df.columns else 0.03
+    df["HBP_pct"] = df["b_hit_by_pitch"].clip(lower=0) / pa if "b_hit_by_pitch" in df.columns else 0.01
+    df["BABIP"]   = df["babip"] if "babip" in df.columns else 0.290
 
-    non_hr = (df["single"] + df["double"] + df["triple"]).clip(lower=1)
-    df["1B_rate"] = df["single"] / non_hr
-    df["2B_rate"] = df["double"] / non_hr
-    df["3B_rate"] = df["triple"] / non_hr
+    singles  = df["single"].clip(lower=0) if "single" in df.columns else pd.Series(0, index=df.index)
+    doubles  = df["double"].clip(lower=0) if "double" in df.columns else pd.Series(0, index=df.index)
+    triples  = df["triple"].clip(lower=0) if "triple" in df.columns else pd.Series(0, index=df.index)
+    non_hr   = (singles + doubles + triples).clip(lower=1)
+    df["1B_rate"] = singles / non_hr
+    df["2B_rate"] = doubles / non_hr
+    df["3B_rate"] = triples / non_hr
 
     # xStats columns for projection fallback (small sample / injured players)
     # Derive proxy K%/BB%/HR% from xba/xslg/xobp when available
@@ -945,6 +983,14 @@ if "players_df" not in st.session_state:
     except FileNotFoundError:
         st.info(t("no_csv"))
         st.session_state.players_df = _SAMPLE_DATA.copy()
+    except Exception as _csv_err:
+        st.warning(
+            f"⚠️ Could not parse `{CSV_PATH}` "
+            f"({type(_csv_err).__name__}: {_csv_err}). "
+            "Check **MANUAL_DOWNLOAD.md** for the correct export format. "
+            "Sample data loaded."
+        )
+        st.session_state.players_df = _SAMPLE_DATA.copy()
 
 _df_all: pd.DataFrame = st.session_state.players_df
 
@@ -1209,10 +1255,10 @@ with tab2:
         row_a = df_pool[df_pool["Name"] == a].iloc[0]
         row_b = df_pool[df_pool["Name"] == b].iloc[0]
 
-        pa   = build_probs(row_a, era_plus)
-        pb   = build_probs(row_b, era_plus)
-        la   = np.array([pa] * 9, dtype=np.float64)
-        lb   = np.array([pb] * 9, dtype=np.float64)
+        probs_a = build_probs(row_a, era_plus)
+        probs_b = build_probs(row_b, era_plus)
+        la      = np.array([probs_a] * 9, dtype=np.float64)
+        lb      = np.array([probs_b] * 9, dtype=np.float64)
 
         lhp_a = np.array([_get_lhp_probs(row_a)] * 9, dtype=np.float64) if use_platoon else None
         lhp_b = np.array([_get_lhp_probs(row_b)] * 9, dtype=np.float64) if use_platoon else None
@@ -1251,8 +1297,7 @@ with tab3:
     if st.button(t("btn_run_sens"), type="primary", key="btn_sens"):
         sens_row = df_pool[df_pool["Name"] == sens_player].iloc[0]
 
-        prog_bar   = st.progress(0.0, text=t("computing"))
-        prog_label = st.empty()
+        prog_bar = st.progress(0.0, text=t("computing"))
 
         def _progress(frac: float):
             prog_bar.progress(min(frac, 1.0), text=f"{t('computing')} {frac*100:.0f}%")
@@ -1263,7 +1308,6 @@ with tab3:
         elapsed = time.time() - start
 
         prog_bar.empty()
-        prog_label.empty()
 
         c1, c2 = st.columns(2)
         c1.metric(t("base_rpg"), f"{base_rpg:.2f}")
