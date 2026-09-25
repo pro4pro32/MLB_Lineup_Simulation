@@ -515,13 +515,24 @@ st.session_state["lang"] = LANGUAGES[chosen_lang]
 
 st.title(t("app_title"))
 
-# Data
-if "players_df" not in st.session_state:
-    try:
-        st.session_state.players_df = load_savant_csv("Batters_Savant_stats.csv")
-    except FileNotFoundError:
-        st.info(t("no_csv"))
+# ── Sezon + dane ──────────────────────────────────────────────────────────────
+season = st.sidebar.selectbox("Sezon / Season", [2026, 2025], index=0)
+csv_path = CSV_BY_SEASON[season]
+
+# przeładuj przy zmianie sezonu lub pierwszym starcie
+if (
+    "players_df" not in st.session_state
+    or st.session_state.get("loaded_season") != season
+):
+    if os.path.exists(csv_path):
+        st.session_state.players_df = load_savant_csv(csv_path)
+        st.session_state.loaded_season = season
+    else:
+        st.sidebar.warning(t("no_csv") + f" — szukano: `{csv_path}`")
         st.session_state.players_df = _SAMPLE_DATA.copy()
+        if "Team" not in st.session_state.players_df.columns:
+            st.session_state.players_df["Team"] = "FA"
+        st.session_state.loaded_season = season
 
 # Sidebar controls
 era_plus   = st.sidebar.slider(t("era_plus"), 70, 150, 100)
