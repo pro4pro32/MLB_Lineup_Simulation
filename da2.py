@@ -128,19 +128,38 @@ def t(key: str) -> str:
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
+import os
+
+CSV_BY_SEASON = {
+    2025: "Batters_2025.csv",
+    2026: "Batters_2026.csv",
+}
+
 @st.cache_data
 def load_savant_csv(path: str) -> pd.DataFrame:
     df = pd.read_csv(path, encoding="utf-8-sig")
     df.columns = df.columns.str.strip().str.lower()
 
-    df["Name"] = df["last_name, first_name"].astype(str).str.strip()
+    # nazwa gracza
+    if "last_name, first_name" in df.columns:
+        df["Name"] = df["last_name, first_name"].astype(str).str.strip()
+    elif "name" in df.columns:
+        df["Name"] = df["name"].astype(str).str.strip()
+    else:
+        raise ValueError(f"Brak kolumny z imieniem w {path}")
 
-    for col in ["pa", "ab", "single", "double", "triple", "home_run",
-                "k_percent", "bb_percent", "babip", "b_hit_by_pitch"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    for col in [
+        "pa", "ab", "single", "double", "triple", "home_run",
+        "k_percent", "bb_percent", "babip", "b_hit_by_pitch",
+    ]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        else:
+            df[col] = 0
 
     df["PA"] = df["pa"].clip(lower=1)
 
+    # k_percent / bb_percent: API daje 0–100 (np. 23.5)
     df["K_pct"]  = df["k_percent"]  / 100.0
     df["BB_pct"] = df["bb_percent"] / 100.0
 
@@ -154,9 +173,17 @@ def load_savant_csv(path: str) -> pd.DataFrame:
     df["2B_rate"] = df["double"] / non_hr
     df["3B_rate"] = df["triple"] / non_hr
 
-    return (df.sort_values("PA", ascending=False)
-              .drop_duplicates("Name")
-              .reset_index(drop=True))
+    # drużyna Z CSV (nie z PLAYER_TEAM)
+    if "team" in df.columns:
+        df["Team"] = df["team"].astype(str).str.upper().fillna("FA")
+    else:
+        df["Team"] = "FA"
+
+    return (
+        df.sort_values("PA", ascending=False)
+          .drop_duplicates("Name")
+          .reset_index(drop=True)
+    )
 
 
 _SAMPLE_DATA = pd.DataFrame({
