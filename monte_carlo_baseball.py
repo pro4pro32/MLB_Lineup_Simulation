@@ -1,17 +1,12 @@
 """
 Monte Carlo Baseball 2025 / 2026
 ================================
-Obsługa plików:
-  Batters_2025_splits.csv
-  Batters_2026_splits.csv
+Pliki w tym samym katalogu:
+  Batters_2025.csv          + Batters_2025_splits.csv
+  Batters_2026.csv          + Batters_2026_splits.csv
 
-Kolumny splitów (opcjonalne):
-  pa_lhp, k_percent_lhp, bb_percent_lhp, babip_lhp, hr_pct_lhp,
-  hbp_pct_lhp, 1b_rate_lhp, 2b_rate_lhp, 3b_rate_lhp
-  (+ analogiczne *_rhp)
-
-Gdy split ma za mało PA → fallback do overall, a przy LHP
-dodatkowo lekka korekta generyczna.
+Baza (overall, Team, Name) ← Batters_YYYY.csv
+Splity vs LHP/RHP           ← merge po player_id z *_splits.csv
 """
 
 from __future__ import annotations
@@ -31,21 +26,20 @@ import streamlit as st
 # ═══════════════════════════════════════════════════════════════════════════════
 
 APP_TITLE   = "Monte Carlo Baseball"
-APP_VERSION = "3.2.0"
-DATA_SOURCE = "MLB Stats API · overall + vs LHP/RHP splits"
+APP_VERSION = "3.3.0"
+DATA_SOURCE = "Batters CSV + LHP/RHP splits (MLB Stats API)"
 
-CSV_BY_SEASON = {
-    2025: "Batters_2025_splits.csv",
-    2026: "Batters_2026_splits.csv",
-}
-# fallbacki, gdy nie ma pliku *_splits
-CSV_FALLBACK = {
+CSV_BASE = {
     2025: "Batters_2025.csv",
     2026: "Batters_2026.csv",
 }
+CSV_SPLITS = {
+    2025: "Batters_2025_splits.csv",
+    2026: "Batters_2026_splits.csv",
+}
 
 PROJECTION_PA_THRESHOLD = 100
-MIN_SPLIT_PA            = 15   # poniżej → nie ufamy splitowi
+MIN_SPLIT_PA            = 15
 _N_GAMES_DEFAULT_MIXED  = 300
 _N_GAMES_DEFAULT_SAME   = 200
 _N_GAMES_DEFAULT_FULL   = 1000
@@ -53,13 +47,6 @@ _N_SENS_POINTS          = 14
 _N_GAMES_SENS           = 150
 
 _PALETTE = ["#4C8AC6", "#E07B54", "#5DBB8A", "#C67BB5", "#E0C454", "#7BC6C6"]
-
-_SAVANT_ALIASES = {
-    "b_pa": "pa", "b_ab": "ab", "b_hit": "hit",
-    "b_single": "single", "b_double": "double", "b_triple": "triple",
-    "b_home_run": "home_run", "b_strikeout": "strikeout", "b_walk": "walk",
-    "b_k_percent": "k_percent", "b_bb_percent": "bb_percent",
-}
 
 TEAMS: dict[str, str] = {
     "New York Yankees": "NYY", "New York Mets": "NYM",
@@ -80,7 +67,7 @@ TEAMS: dict[str, str] = {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 2. i18n (skrócone — te same klucze co wcześniej)
+# 2. i18n
 # ═══════════════════════════════════════════════════════════════════════════════
 
 LANGUAGES = {
@@ -224,13 +211,13 @@ _TR: dict[str, dict[str, str]] = {
     "lineup_reset": {"en": "Lineup reset", "pl": "Lineup zresetowany", "es": "Reiniciada",
                      "fr": "Réinitialisé", "ja": "リセット"},
     "team_not_found": {
-        "en": "Not enough players for this team (try lower min PA).",
-        "pl": "Za mało graczy w drużynie (obniż min PA).",
+        "en": "Not enough players (try lower min PA).",
+        "pl": "Za mało graczy (obniż min PA).",
         "es": "Pocos jugadores.", "fr": "Pas assez de joueurs.", "ja": "選手不足",
     },
     "proj_note": {
-        "en": "Using xStats / small-sample projection (PA < 100)",
-        "pl": "Projekcja / mała próbka (PA < 100)",
+        "en": "Using projection (PA < 100)",
+        "pl": "Projekcja (PA < 100)",
         "es": "Proyección (PA < 100)", "fr": "Projection (PA < 100)", "ja": "予測 (PA < 100)",
     },
     "upload_ok": {"en": "Lineup imported.", "pl": "Lineup zaimportowany.",
@@ -246,162 +233,109 @@ def t(key: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 3. DATA LOADING
+# 3. DATA LOADING  (Batters + splits merge)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _to_frac(series: pd.Series, default: float = 0.0) -> pd.Series:
-    """k_percent bywa 22.5 albo 0.225 → zawsze ułamek 0–1."""
-    s = pd.to_numeric(series, errors="coerce")
+def _series(df: pd.DataFrame, *names: str) -> pd.Series | None:
+    """Pierwsza istniejąca kolumna jako Series (obsługa zduplikowanych nazw)."""
+    for n in names:
+        if n not in df.columns:
+            continue
+        col = df[n]
+        if isinstance(col, pd.DataFrame):
+            col = col.iloc[:, 0]
+        return col
+    return None
+
+
+def _dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if not df.columns.duplicated().any():
+        return df
+    return df.loc[:, ~df.columns.duplicated()].copy()
+
+
+def _to_frac(s: pd.Series, default: float = 0.0) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce")
     med = s.median(skipna=True)
     if pd.notna(med) and med > 1.0:
         s = s / 100.0
     return s.fillna(default)
 
 
-@st.cache_data(show_spinner=False)
-def load_batters_csv(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path, encoding="utf-8-sig")
-    df.columns = df.columns.str.strip().str.lower()
-
-    for old, new in _SAVANT_ALIASES.items():
-        if old in df.columns and new not in df.columns:
-            df = df.rename(columns={old: new})
-
-    # Name
-    if "last_name, first_name" in df.columns:
-        df["Name"] = df["last_name, first_name"].astype(str).str.strip()
-    elif "name" in df.columns:
-        df["Name"] = df["name"].astype(str).str.strip()
-    elif "last_name" in df.columns and "first_name" in df.columns:
-        df["Name"] = (
-            df["last_name"].astype(str).str.strip()
-            + ", "
-            + df["first_name"].astype(str).str.strip()
-        )
+def _norm_name_col(df: pd.DataFrame) -> pd.DataFrame:
+    ln = _series(df, "last_name, first_name")
+    if ln is not None:
+        df["Name"] = ln.astype(str).str.strip()
+    elif _series(df, "name") is not None:
+        df["Name"] = _series(df, "name").astype(str).str.strip()
     else:
         df["Name"] = df.iloc[:, 0].astype(str).str.strip()
+    return df
 
-    # numeric overall + split columns
-    num_candidates = [
+
+def _norm_team_col(df: pd.DataFrame) -> pd.DataFrame:
+    raw = _series(df, "team")
+    if raw is None:
+        df["Team"] = "FA"
+        return df
+    tser = (
+        raw.astype(str).str.strip().str.upper()
+        .replace({
+            "NAN": "FA", "NONE": "FA", "": "FA",
+            "2TM": "FA", "3TM": "FA", "ATH": "OAK", "AZ": "ARI",
+        })
+    )
+    df["Team"] = tser.fillna("FA")
+    return df
+
+
+def _process_overall(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = df.columns.str.strip().str.lower()
+    df = _dedupe_columns(df)
+    df = _norm_name_col(df)
+    df = _norm_team_col(df)
+
+    for c in [
         "pa", "ab", "single", "double", "triple", "home_run",
         "k_percent", "bb_percent", "babip", "b_hit_by_pitch",
-        "k_pct", "bb_pct", "hr_pct", "hbp_pct",
-        "1b_rate", "2b_rate", "3b_rate",
-        "xba", "xslg", "xobp",
-        # splits
-        "pa_lhp", "ab_lhp", "single_lhp", "double_lhp", "triple_lhp", "home_run_lhp",
-        "k_percent_lhp", "bb_percent_lhp", "babip_lhp", "hbp_lhp",
-        "hr_pct_lhp", "hbp_pct_lhp", "1b_rate_lhp", "2b_rate_lhp", "3b_rate_lhp",
-        "pa_rhp", "ab_rhp", "single_rhp", "double_rhp", "triple_rhp", "home_run_rhp",
-        "k_percent_rhp", "bb_percent_rhp", "babip_rhp", "hbp_rhp",
-        "hr_pct_rhp", "hbp_pct_rhp", "1b_rate_rhp", "2b_rate_rhp", "3b_rate_rhp",
-    ]
-    for col in num_candidates:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+        "xba", "xslg", "xobp", "player_id",
+    ]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    if "pa" not in df.columns:
-        df["pa"] = 0.0
-    df["PA"] = df["pa"].fillna(0).clip(lower=1)
-
-    # overall rates
-    if "k_pct" in df.columns and df["k_pct"].notna().any():
-        df["K_pct"] = _to_frac(df["k_pct"], 0.22)
-    elif "k_percent" in df.columns:
-        df["K_pct"] = _to_frac(df["k_percent"], 0.22)
-    else:
-        df["K_pct"] = 0.22
-
-    if "bb_pct" in df.columns and df["bb_pct"].notna().any():
-        df["BB_pct"] = _to_frac(df["bb_pct"], 0.08)
-    elif "bb_percent" in df.columns:
-        df["BB_pct"] = _to_frac(df["bb_percent"], 0.08)
-    else:
-        df["BB_pct"] = 0.08
-
+    df["PA"] = pd.to_numeric(_series(df, "pa"), errors="coerce").fillna(0).clip(lower=1)
     pa = df["PA"]
-    if "hr_pct" in df.columns and df["hr_pct"].notna().any():
-        df["HR_pct"] = df["hr_pct"].fillna(0.03).clip(0, 0.2)
-    elif "home_run" in df.columns:
-        df["HR_pct"] = (df["home_run"].fillna(0) / pa).clip(0, 0.2)
-    else:
-        df["HR_pct"] = 0.03
 
-    if "hbp_pct" in df.columns and df["hbp_pct"].notna().any():
-        df["HBP_pct"] = df["hbp_pct"].fillna(0.01).clip(0, 0.1)
-    elif "b_hit_by_pitch" in df.columns:
-        df["HBP_pct"] = (df["b_hit_by_pitch"].fillna(0) / pa).clip(0, 0.1)
-    else:
-        df["HBP_pct"] = 0.01
+    k_raw = _series(df, "k_percent", "k_pct")
+    bb_raw = _series(df, "bb_percent", "bb_pct")
+    df["K_pct"] = _to_frac(k_raw, 0.22) if k_raw is not None else 0.22
+    df["BB_pct"] = _to_frac(bb_raw, 0.08) if bb_raw is not None else 0.08
 
-    df["BABIP"] = df["babip"].fillna(0.290) if "babip" in df.columns else 0.290
+    hr = _series(df, "home_run")
+    hbp = _series(df, "b_hit_by_pitch")
+    df["HR_pct"] = (hr.fillna(0) / pa).clip(0, 0.2) if hr is not None else 0.03
+    df["HBP_pct"] = (hbp.fillna(0) / pa).clip(0, 0.1) if hbp is not None else 0.01
 
-    for side, prefix in [("overall", ""), ("lhp", "_lhp"), ("rhp", "_rhp")]:
-        if prefix == "":
-            s_col, d_col, t_col = "single", "double", "triple"
-            r1, r2, r3 = "1B_rate", "2B_rate", "3B_rate"
-        else:
-            s_col, d_col, t_col = f"single{prefix}", f"double{prefix}", f"triple{prefix}"
-            r1, r2, r3 = f"1B_rate{prefix}", f"2B_rate{prefix}", f"3B_rate{prefix}"
-            # już mogą być policzone w CSV
-            if r1.lower() in df.columns:
-                df[r1] = df[r1.lower()]
-                df[r2] = df[r2.lower()]
-                df[r3] = df[r3.lower()]
-                continue
-        if s_col in df.columns:
-            s = df[s_col].fillna(0).clip(lower=0)
-            d = df[d_col].fillna(0).clip(lower=0) if d_col in df.columns else 0
-            t3 = df[t_col].fillna(0).clip(lower=0) if t_col in df.columns else 0
-            non_hr = (s + d + t3).clip(lower=1)
-            df[r1] = s / non_hr
-            df[r2] = d / non_hr
-            df[r3] = t3 / non_hr
-        elif prefix == "":
-            df["1B_rate"] = 0.70
-            df["2B_rate"] = 0.20
-            df["3B_rate"] = 0.05
+    bab = _series(df, "babip")
+    df["BABIP"] = pd.to_numeric(bab, errors="coerce").fillna(0.290) if bab is not None else 0.290
 
-    # znormalizuj nazwy split rate z CSV (lowercase → canonical)
-    rename_split = {}
-    for side in ("lhp", "rhp"):
-        for src, dst in [
-            (f"k_percent_{side}", f"K_pct_{side}"),
-            (f"bb_percent_{side}", f"BB_pct_{side}"),
-            (f"babip_{side}", f"BABIP_{side}"),
-            (f"hr_pct_{side}", f"HR_pct_{side}"),
-            (f"hbp_pct_{side}", f"HBP_pct_{side}"),
-            (f"1b_rate_{side}", f"1B_rate_{side}"),
-            (f"2b_rate_{side}", f"2B_rate_{side}"),
-            (f"3b_rate_{side}", f"3B_rate_{side}"),
-            (f"pa_{side}", f"PA_{side}"),
-        ]:
-            if src in df.columns:
-                rename_split[src] = dst
-    df = df.rename(columns=rename_split)
+    s = _series(df, "single")
+    d = _series(df, "double")
+    t3 = _series(df, "triple")
+    s = s.fillna(0).clip(lower=0) if s is not None else 0
+    d = d.fillna(0).clip(lower=0) if d is not None else 0
+    t3 = t3.fillna(0).clip(lower=0) if t3 is not None else 0
+    non_hr = (s + d + t3).clip(lower=1)
+    df["1B_rate"] = s / non_hr
+    df["2B_rate"] = d / non_hr
+    df["3B_rate"] = t3 / non_hr
 
-    # k_percent_lhp jako 0–100 → ułamek
-    for side in ("lhp", "rhp"):
-        kcol = f"K_pct_{side}"
-        bcol = f"BB_pct_{side}"
-        if kcol in df.columns:
-            df[kcol] = _to_frac(df[kcol], np.nan)
-        if bcol in df.columns:
-            df[bcol] = _to_frac(df[bcol], np.nan)
-        # jeśli w CSV było k_percent_lhp nie przemianowane
-        raw_k = f"k_percent_{side}"
-        if raw_k in df.columns and kcol not in df.columns:
-            df[kcol] = _to_frac(df[raw_k], np.nan)
-        raw_b = f"bb_percent_{side}"
-        if raw_b in df.columns and bcol not in df.columns:
-            df[bcol] = _to_frac(df[raw_b], np.nan)
-
-    # xStats fallback overall
     if all(c in df.columns for c in ("xba", "xobp", "xslg")):
         xba = df["xba"].fillna(0).clip(0.10, 0.40)
         xobp = df["xobp"].fillna(0).clip(0.15, 0.55)
         xslg = df["xslg"].fillna(0).clip(0.20, 0.80)
-        xiso = (xslg - xba).clip(lower=0.0)
+        xiso = (xslg - xba).clip(lower=0)
         df["xK_pct"] = df["K_pct"]
         df["xBB_pct"] = (xobp - xba).clip(0.02, 0.25)
         df["xHR_pct"] = (xiso * 0.35).clip(upper=0.12)
@@ -412,16 +346,8 @@ def load_batters_csv(path: str) -> pd.DataFrame:
         df["xHR_pct"] = df["HR_pct"]
         df["xBABIP"] = df["BABIP"]
 
-    # Team
-    if "team" in df.columns:
-        df["Team"] = (
-            df["team"].astype(str).str.strip().str.upper()
-            .replace({"NAN": "FA", "NONE": "FA", "": "FA", "2TM": "FA", "3TM": "FA",
-                      "ATH": "OAK"})
-        )
-        df["Team"] = df["Team"].fillna("FA")
-    else:
-        df["Team"] = "FA"
+    if "player_id" in df.columns:
+        df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce")
 
     return (
         df.sort_values("PA", ascending=False)
@@ -430,14 +356,88 @@ def load_batters_csv(path: str) -> pd.DataFrame:
     )
 
 
-def resolve_csv_path(season: int) -> str | None:
-    primary = CSV_BY_SEASON.get(season, "")
-    if primary and os.path.exists(primary):
-        return primary
-    fb = CSV_FALLBACK.get(season, "")
-    if fb and os.path.exists(fb):
-        return fb
-    return None
+def _extract_split_side(df: pd.DataFrame, side: str) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = df.columns.str.strip().str.lower()
+    df = _dedupe_columns(df)
+    if "player_id" not in df.columns:
+        return pd.DataFrame()
+
+    out = pd.DataFrame({"player_id": pd.to_numeric(df["player_id"], errors="coerce")})
+
+    pa = _series(df, f"pa_{side}")
+    out[f"PA_{side}"] = pd.to_numeric(pa, errors="coerce") if pa is not None else np.nan
+
+    k = _series(df, f"k_percent_{side}", f"k_pct_{side}")
+    bb = _series(df, f"bb_percent_{side}", f"bb_pct_{side}")
+    out[f"K_pct_{side}"] = _to_frac(k, np.nan) if k is not None else np.nan
+    out[f"BB_pct_{side}"] = _to_frac(bb, np.nan) if bb is not None else np.nan
+
+    bab = _series(df, f"babip_{side}")
+    out[f"BABIP_{side}"] = pd.to_numeric(bab, errors="coerce") if bab is not None else np.nan
+
+    hr = _series(df, f"hr_pct_{side}")
+    if hr is not None:
+        out[f"HR_pct_{side}"] = pd.to_numeric(hr, errors="coerce")
+    else:
+        hr_n = _series(df, f"home_run_{side}")
+        pa_s = out[f"PA_{side}"]
+        out[f"HR_pct_{side}"] = (
+            pd.to_numeric(hr_n, errors="coerce").fillna(0) / pa_s.replace(0, np.nan)
+            if hr_n is not None else np.nan
+        )
+
+    hbp = _series(df, f"hbp_pct_{side}")
+    out[f"HBP_pct_{side}"] = pd.to_numeric(hbp, errors="coerce") if hbp is not None else np.nan
+
+    for rate_name, canon in [
+        ("1b_rate", "1B_rate"), ("2b_rate", "2B_rate"), ("3b_rate", "3B_rate"),
+    ]:
+        r = _series(df, f"{rate_name}_{side}")
+        out[f"{canon}_{side}"] = pd.to_numeric(r, errors="coerce") if r is not None else np.nan
+
+    if out[f"1B_rate_{side}"].isna().all():
+        s = _series(df, f"single_{side}")
+        d = _series(df, f"double_{side}")
+        t3 = _series(df, f"triple_{side}")
+        if s is not None:
+            s = pd.to_numeric(s, errors="coerce").fillna(0)
+            d = pd.to_numeric(d, errors="coerce").fillna(0) if d is not None else 0
+            t3 = pd.to_numeric(t3, errors="coerce").fillna(0) if t3 is not None else 0
+            non = (s + d + t3).clip(lower=1)
+            out[f"1B_rate_{side}"] = s / non
+            out[f"2B_rate_{side}"] = d / non
+            out[f"3B_rate_{side}"] = t3 / non
+
+    mask = out[f"PA_{side}"].fillna(0) < MIN_SPLIT_PA
+    for c in out.columns:
+        if c not in ("player_id", f"PA_{side}"):
+            out.loc[mask, c] = np.nan
+
+    return out.drop_duplicates("player_id")
+
+
+@st.cache_data(show_spinner=False)
+def load_season_data(season: int) -> pd.DataFrame:
+    """Batters_YYYY.csv (overall) + merge splitów z *_splits.csv po player_id."""
+    base_path = CSV_BASE.get(season)
+    split_path = CSV_SPLITS.get(season)
+
+    if not base_path or not os.path.exists(base_path):
+        if split_path and os.path.exists(split_path):
+            return _process_overall(pd.read_csv(split_path, encoding="utf-8-sig"))
+        raise FileNotFoundError(base_path or f"Batters_{season}.csv")
+
+    df = _process_overall(pd.read_csv(base_path, encoding="utf-8-sig"))
+
+    if split_path and os.path.exists(split_path) and "player_id" in df.columns:
+        sp = pd.read_csv(split_path, encoding="utf-8-sig")
+        for side in ("lhp", "rhp"):
+            side_df = _extract_split_side(sp, side)
+            if not side_df.empty:
+                df = df.merge(side_df, on="player_id", how="left")
+
+    return df
 
 
 _SAMPLE_DATA = pd.DataFrame({
@@ -466,7 +466,7 @@ def default_lineup_for_team(df: pd.DataFrame, team_abbr: str, n: int = 9) -> lis
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 4. STAT DERIVATION (custom)
+# 4. STAT DERIVATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _derive_hit_split(iso: float) -> tuple[float, float, float]:
@@ -618,7 +618,7 @@ def simulate_games(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 7. HELPERS — overall / LHP / RHP stats z wiersza
+# 7. HELPERS — overall / LHP / RHP
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _sg(row: pd.Series, col: str, default: float) -> float:
@@ -636,8 +636,7 @@ def _use_projection(row: pd.Series) -> bool:
 
 
 def _has_real_split(row: pd.Series, side: str) -> bool:
-    """side = 'lhp' | 'rhp'."""
-    pa = _sg(row, f"PA_{side}", 0) or _sg(row, f"pa_{side}", 0)
+    pa = _sg(row, f"PA_{side}", 0)
     k = row.get(f"K_pct_{side}")
     if pa < MIN_SPLIT_PA:
         return False
@@ -660,10 +659,6 @@ def _stat_tuple_overall(row: pd.Series) -> tuple[float, ...]:
 
 
 def _stat_tuple_side(row: pd.Series, side: str) -> tuple[float, ...]:
-    """
-    Prawdziwy split jeśli jest; inaczej overall.
-    Dla LHP bez splitu: lekka korekta generyczna na overall.
-    """
     if _has_real_split(row, side):
         k = _sg(row, f"K_pct_{side}", 0.22)
         bb = _sg(row, f"BB_pct_{side}", 0.08)
@@ -677,7 +672,6 @@ def _stat_tuple_side(row: pd.Series, side: str) -> tuple[float, ...]:
 
     k, bb, hbp, hr, bab, r1, r2, r3 = _stat_tuple_overall(row)
     if side == "lhp":
-        # generyczny RHH-vs-LHP, gdy brak prawdziwego splitu
         k *= 1.08
         bb *= 0.95
         hr *= 0.90
@@ -695,16 +689,9 @@ def build_probs_lhp(row: pd.Series, era_plus: int) -> np.ndarray:
     return get_batter_probs(k, bb, hbp, hr, bab, r1, r2, r3, era_plus)
 
 
-def build_probs(row: pd.Series, era_plus: int) -> np.ndarray:
-    """Domyślnie vs RHP (większość PA w lidze)."""
-    return build_probs_rhp(row, era_plus)
-
-
 def prob_label(row: pd.Series, era_plus: int) -> str:
     p = build_probs_rhp(row, era_plus)
-    has_l = _has_real_split(row, "lhp")
-    has_r = _has_real_split(row, "rhp")
-    if has_l or has_r:
+    if _has_real_split(row, "lhp") or _has_real_split(row, "rhp"):
         badge = f"📊 {t('data_badge_split')}"
     elif _use_projection(row):
         badge = f"🔮 {t('data_badge_proj')}"
@@ -720,18 +707,18 @@ def prob_label(row: pd.Series, era_plus: int) -> str:
 def split_source_caption(row: pd.Series) -> str:
     parts = []
     if _has_real_split(row, "lhp"):
-        parts.append(f"LHP PA={int(_sg(row, 'PA_lhp', 0) or _sg(row, 'pa_lhp', 0))}")
+        parts.append(f"LHP PA={int(_sg(row, 'PA_lhp', 0))}")
     else:
         parts.append("LHP: fallback")
     if _has_real_split(row, "rhp"):
-        parts.append(f"RHP PA={int(_sg(row, 'PA_rhp', 0) or _sg(row, 'pa_rhp', 0))}")
+        parts.append(f"RHP PA={int(_sg(row, 'PA_rhp', 0))}")
     else:
         parts.append("RHP: overall")
     return " · ".join(parts)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 8. SENSITIVITY + CHARTS (bez zmian logiki)
+# 8. SENSITIVITY + CHARTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _SENS_RANGES = {
@@ -870,7 +857,7 @@ def _detail_chart(detail: dict) -> go.Figure:
 
 
 def _lineup_to_json(lineup: list[str]) -> str:
-    return json.dumps({"version": "3.2", "lineup": lineup}, ensure_ascii=False, indent=2)
+    return json.dumps({"version": "3.3", "lineup": lineup}, ensure_ascii=False, indent=2)
 
 
 def _json_to_lineup(raw: bytes) -> list[str] | None:
@@ -912,34 +899,26 @@ st.caption(t("app_subtitle"))
 
 # ── Season + data ─────────────────────────────────────────────────────────────
 season = st.sidebar.selectbox(t("season"), [2026, 2025], index=0, key="season_sel")
-csv_path = resolve_csv_path(season)
 
 if (
     "players_df" not in st.session_state
     or st.session_state.get("loaded_season") != season
-    or st.session_state.get("loaded_path") != csv_path
 ):
     try:
-        if csv_path:
-            st.session_state.players_df = load_batters_csv(csv_path)
-            st.session_state.loaded_season = season
-            st.session_state.loaded_path = csv_path
-        else:
-            raise FileNotFoundError("no csv")
+        st.session_state.players_df = load_season_data(season)
+        st.session_state.loaded_season = season
     except FileNotFoundError:
-        st.info(t("no_csv") + f" (szukano {CSV_BY_SEASON.get(season)})")
+        st.info(t("no_csv") + f" (Batters_{season}.csv)")
         st.session_state.players_df = _SAMPLE_DATA.copy()
         st.session_state.loaded_season = season
-        st.session_state.loaded_path = None
     except Exception as e:
         st.warning(f"⚠️ CSV: {type(e).__name__}: {e}. Sample data.")
         st.session_state.players_df = _SAMPLE_DATA.copy()
         st.session_state.loaded_season = season
-        st.session_state.loaded_path = None
 
 _df_all: pd.DataFrame = st.session_state.players_df
 
-# ── Simulation controls ───────────────────────────────────────────────────────
+# ── Simulation ────────────────────────────────────────────────────────────────
 st.sidebar.markdown(f"### {t('sec_sim')}")
 era_plus = st.sidebar.slider(t("era_plus"), 70, 150, 100, help=t("era_plus_help"))
 min_pa = st.sidebar.slider(t("min_pa"), 0, 700, 0)
@@ -957,7 +936,6 @@ lhp_rate = lhp_pct / 100.0
 n_mixed = _N_GAMES_DEFAULT_MIXED if ultra_fast else _N_GAMES_DEFAULT_FULL
 n_same = _N_GAMES_DEFAULT_SAME if ultra_fast else _N_GAMES_DEFAULT_FULL // 2
 
-# ile graczy ma prawdziwe splity
 n_split_l = int(_df_all.apply(lambda r: _has_real_split(r, "lhp"), axis=1).sum()) if len(_df_all) else 0
 n_split_r = int(_df_all.apply(lambda r: _has_real_split(r, "rhp"), axis=1).sum()) if len(_df_all) else 0
 
@@ -1002,8 +980,9 @@ st.sidebar.markdown("---")
 st.sidebar.caption(f"📂 {DATA_SOURCE}")
 st.sidebar.caption(f"v{APP_VERSION} · sezon {season} · {len(_df_all)} graczy")
 st.sidebar.caption(f"Splity LHP: {n_split_l} · RHP: {n_split_r}")
-if csv_path:
-    st.sidebar.caption(f"📄 {csv_path}")
+base_file = CSV_BASE.get(season, "")
+if base_file and os.path.exists(base_file):
+    st.sidebar.caption(f"📄 {base_file}")
 
 # ── Custom player ─────────────────────────────────────────────────────────────
 with st.sidebar.expander(t("sec_player")):
@@ -1153,7 +1132,10 @@ with tab1:
         c1.metric(t("rpg"), f"{rpg:.2f}")
         c2.metric(t("rps"), f"{int(rpg * 162)}")
         c3.metric(t("elapsed"), f"{elapsed:.2f}s")
-        st.caption(f"⚔ vs LHP **{lhp_pct}%** · vs RHP **{rhp_pct}%** (prawdziwe splity gdy PA≥{MIN_SPLIT_PA})")
+        st.caption(
+            f"⚔ vs LHP **{lhp_pct}%** · vs RHP **{rhp_pct}%** "
+            f"(prawdziwe splity gdy PA≥{MIN_SPLIT_PA})"
+        )
         with st.expander(t("prob_header")):
             for line in debug_lines:
                 st.markdown(line)
@@ -1172,8 +1154,14 @@ with tab2:
         row_b = df_pool[df_pool["Name"] == b].iloc[0]
         la_r = np.array([build_probs_rhp(row_a, era_plus)] * 9, dtype=np.float64)
         lb_r = np.array([build_probs_rhp(row_b, era_plus)] * 9, dtype=np.float64)
-        la_l = np.array([build_probs_lhp(row_a, era_plus)] * 9, dtype=np.float64) if lhp_pct > 0 else None
-        lb_l = np.array([build_probs_lhp(row_b, era_plus)] * 9, dtype=np.float64) if lhp_pct > 0 else None
+        la_l = (
+            np.array([build_probs_lhp(row_a, era_plus)] * 9, dtype=np.float64)
+            if lhp_pct > 0 else None
+        )
+        lb_l = (
+            np.array([build_probs_lhp(row_b, era_plus)] * 9, dtype=np.float64)
+            if lhp_pct > 0 else None
+        )
 
         with st.spinner(t("spinner")):
             start = time.time()
@@ -1187,8 +1175,12 @@ with tab2:
         m3.metric(t("elapsed"), f"{elapsed:.2f}s")
         st.caption(f"⚔ vs LHP {lhp_pct}% · vs RHP {rhp_pct}%")
         with st.expander(t("prob_header")):
-            st.markdown(f"**{a}** — {prob_label(row_a, era_plus)}  \n_{split_source_caption(row_a)}_")
-            st.markdown(f"**{b}** — {prob_label(row_b, era_plus)}  \n_{split_source_caption(row_b)}_")
+            st.markdown(
+                f"**{a}** — {prob_label(row_a, era_plus)}  \n_{split_source_caption(row_a)}_"
+            )
+            st.markdown(
+                f"**{b}** — {prob_label(row_b, era_plus)}  \n_{split_source_caption(row_b)}_"
+            )
 
 # ── TAB 3 ─────────────────────────────────────────────────────────────────────
 with tab3:
@@ -1201,7 +1193,7 @@ with tab3:
         prog = st.progress(0.0, text=t("computing"))
 
         def _progress(frac: float):
-            prog.progress(min(frac, 1.0), text=f"{t('computing')} {frac*100:.0f}%")
+            prog.progress(min(frac, 1.0), text=f"{t('computing')} {frac * 100:.0f}%")
 
         start = time.time()
         base_rpg, tornado, deltas, obp_curve, slg_curve, detail = compute_sensitivity(
@@ -1216,10 +1208,15 @@ with tab3:
         st.caption(split_source_caption(sens_row))
 
         st.subheader(t("tornado_title"))
-        st.plotly_chart(_tornado_chart(tornado, base_rpg), use_container_width=True, key="tornado")
+        st.plotly_chart(
+            _tornado_chart(tornado, base_rpg), use_container_width=True, key="tornado"
+        )
         st.subheader(t("obp_slg_title"))
         st.plotly_chart(
-            _obp_slg_chart(deltas, obp_curve, slg_curve), use_container_width=True, key="obp_slg"
+            _obp_slg_chart(deltas, obp_curve, slg_curve),
+            use_container_width=True, key="obp_slg",
         )
         with st.expander(t("detail_curves")):
-            st.plotly_chart(_detail_chart(detail), use_container_width=True, key="detail")
+            st.plotly_chart(
+                _detail_chart(detail), use_container_width=True, key="detail"
+            )
